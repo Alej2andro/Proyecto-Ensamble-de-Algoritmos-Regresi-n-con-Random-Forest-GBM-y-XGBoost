@@ -58,5 +58,3 @@ Aprendizaje autodidacta con foco en rigor matemático y accionabilidad de result
 [![Email](https://img.shields.io/badge/Email-alejandro.figueroa.rojas%40gmail.com-green?logo=gmail)](mailto:alejandro.figueroa.rojas@gmail.com)
 
 ---
-
-*Metodología de selección de características basada en el curso de Reconocimiento de Patrones del Prof. Domingo Mery — DCC PUC Chile.*
