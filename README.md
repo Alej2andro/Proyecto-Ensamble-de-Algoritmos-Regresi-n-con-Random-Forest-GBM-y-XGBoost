@@ -2,7 +2,7 @@
 
 > *"No basta con que el modelo converja. Necesito entender por qué converge."*
 
-Pipeline completo de predicción de precios inmobiliarios (Boston Housing) con selección formal de características y comparación de tres algoritmos de ensamble. Cada decisión de modelado tiene justificación matemática explícita, desarrollado de forma autodidacta siguiendo la metodología del Prof. Domingo Mery (DCC PUC Chile).
+Pipeline completo de predicción de precios inmobiliarios (Boston Housing) con selección formal de características y comparación de tres algoritmos de ensamble. Cada decisión de modelado tiene justificación matemática explícita, desarrollado de forma autodidacta.
 
 ---
 
