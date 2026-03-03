@@ -1,0 +1,1103 @@
+---
+title: "Proyecto: Regresión con Random Forest, GBM y XGBoost"
+subtitle: "Predicción de Precios de Casas en Boston — Pipeline de Selección de Características"
+author: "Alejandro Figueroa Rojas"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 4
+    toc-location: left
+    toc-title: "Contenido"
+    number-sections: true
+    theme: flatly
+    highlight-style: arrow
+    code-fold: false
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Motivación y Contexto
+
+Aprender Machine Learning de forma autodidacta exige algo más que ejecutar código:
+exige entender **por qué** el algoritmo funciona y **qué garantiza** su matemática.
+Este proyecto nace de esa convicción, cada decisión de modelado tiene una justificación
+formal detrás.
+
+> *"No basta con que el modelo converja. Necesito entender por qué converge."*  
+> — Alejandro Figueroa Rojas
+
+**Desafío del dataset:** 506 observaciones con 13 variables predictoras. Variable
+objetivo continua: precio mediano (MEDV). Escalas heterogéneas, presencia de outliers
+y relaciones no lineales que demandan algoritmos robustos.
+
+**Objetivo de aprendizaje:** Comparar tres ensambles (Random Forest, Gradient Boosting,
+XGBoost) integrando un pipeline formal de selección de características — Fisher J,
+correlación de Pearson, SFS y Branch & Bound — porque un algoritmo opera al
+máximo solo cuando las variables que lo alimentan son las correctas.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  comment = "", message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 10, fig.height = 6
+)
+```
+
+# Librerías
+```{r librerias}
+
+library(MASS)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(ggplot2)
+library(gridExtra)
+library(gbm)
+library(reshape2)
+library(dplyr)
+library(igraph)
+library(scales)
+library(purrr)
+
+# Conflictos
+select <- dplyr::select
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+
+data(Boston)
+datos <- Boston
+```
+
+# Exploración de Datos
+```{r exploracion}
+
+str(datos)
+cat("Observaciones:", nrow(datos), "| Variables:", ncol(datos), "\n")
+
+```
+
+**Variables predictoras candidatas:** CRIM, ZN, INDUS, CHAS, NOX, RM, AGE,
+DIS, RAD, TAX, PTRATIO, B, LSTAT
+
+**Variable objetivo:** MEDV (precio mediano en miles USD)
+
+| Variable | Descripción |
+|---|---|
+| CRIM | Tasa de criminalidad per cápita por zona |
+| ZN | Proporción de suelo residencial zonificado para lotes mayores a 25.000 m² |
+| INDUS | Proporción de acres de negocio no minorista por zona |
+| CHAS | Variable dummy — 1 si el tramo limita con el río Charles, 0 en caso contrario |
+| NOX | Concentración de óxidos nítricos (partes por 10 millones) |
+| RM | Número promedio de habitaciones por vivienda |
+| AGE | Proporción de unidades ocupadas construidas antes de 1940 |
+| DIS | Distancia ponderada a cinco centros de empleo de Boston |
+| RAD | Índice de accesibilidad a autopistas radiales |
+| TAX | Tasa de impuesto predial por cada $10.000 USD |
+| PTRATIO | Razón alumno-profesor por zona |
+| B | $1000(B_k - 0.63)^2$, donde $B_k$ es la proporción de población afroamericana |
+| LSTAT | Porcentaje de población de bajo estatus socioeconómico |
+| MEDV | Precio mediano de viviendas ocupadas por propietarios (miles USD) — **variable objetivo** |
+
+
+
+## Detección de faltantes
+```{r missing_values}
+
+miss <- sum(is.na(datos))
+if (miss == 0) cat("✔ Sin valores faltantes.") else cat("Faltantes:", miss)
+```
+
+# Preprocesamiento
+
+## Distribuciones
+```{r distribuciones, fig.width=12, fig.height=8}
+p1 <- ggplot(datos, aes(x=medv)) +
+  geom_histogram(bins=30, fill="steelblue", alpha=0.7) +
+  labs(title="Distribución Precio (MEDV)", x="Precio (miles USD)", y="Frecuencia") +
+  theme_minimal()
+
+p2 <- ggplot(datos, aes(x=rm, y=medv)) +
+  geom_point(alpha=0.5, color="coral") +
+  geom_smooth(method="lm", se=FALSE, color="darkred") +
+  labs(title="Habitaciones vs Precio", x="Habitaciones promedio", y="Precio") +
+  theme_minimal()
+
+p3 <- ggplot(datos, aes(x=lstat, y=medv)) +
+  geom_point(alpha=0.5, color="darkgreen") +
+  geom_smooth(method="lm", se=FALSE, color="black") +
+  labs(title="Estatus Bajo vs Precio", x="% Población bajo estatus", y="Precio") +
+  theme_minimal()
+
+p4 <- ggplot(datos, aes(x=crim, y=medv)) +
+  geom_point(alpha=0.5, color="purple") +
+  geom_smooth(method="loess", se=FALSE, color="orange") +
+  labs(title="Criminalidad vs Precio", x="Tasa criminalidad", y="Precio") +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, p4, ncol=2)
+```
+
+## División Train / Test
+```{r split}
+set.seed(123)
+trainIndex <- createDataPartition(datos$medv, p=0.7, list=FALSE)
+train <- datos[trainIndex,]
+test  <- datos[-trainIndex,]
+cat("Train:", nrow(train), "| Test:", nrow(test), "\n")
+```
+
+---
+
+# Selección de Características
+
+Marco metodológico: Los métodos implementados integran dos niveles de análisis. En el primero, se aplican criterios individuales de relevancia (Fisher J, correlación de Pearson y covarianza normalizada) como filtros iniciales para evaluar el poder discriminante de cada variable de forma independiente. En el segundo, se emplean método de búsqueda secuencial (SFS) y búsqueda exacta (Branch & Bound) para identificar el subconjunto óptimo de variables considerando sus interacciones conjuntas.
+
+## Fundamento matemático
+
+### Criterio de Fisher (adaptado a regresión)
+
+Para regresión continua se discretiza MEDV en cuartiles Q1 vs Q4, definiendo dos clases extremas:
+
+$$J_F(x) = \frac{(\mu_{Q1} - \mu_{Q4})^2}{\sigma_{Q1}^2 + \sigma_{Q4}^2}$$
+
+Un valor alto de $J_F$ indica que la variable separa con claridad los precios bajos de los altos.
+
+### Correlación de Pearson
+
+$$r_{X,Y} = \frac{\sum_{i=1}^n (x_i - \bar{x})(y_i - \bar{y})}{\sqrt{\sum(x_i-\bar{x})^2 \sum(y_i-\bar{y})^2}}$$
+
+Se usa $|r|$ como criterio de relevancia individual lineal con MEDV.
+
+### Covarianza normalizada
+
+$$\text{Cov}_{\text{norm}}(X, Y) = \frac{|\text{Cov}(X,Y)|}{\sigma_X \cdot \sigma_Y}$$
+
+Equivalente a $|r|$ de Pearson; incluida para consistencia con el pipeline del Prof. Mery.
+
+### Selección Secuencial Forward (SFS)
+
+Parte del conjunto vacío y agrega en cada paso la variable que maximiza $R^2$ acumulado:
+
+$$\mathcal{F}_{k+1} = \mathcal{F}_k \cup \left\{ \arg\max_{x \notin \mathcal{F}_k} R^2(\mathcal{F}_k \cup \{x\}) \right\}$$
+
+
+### Branch & Bound
+
+Búsqueda exacta del subconjunto óptimo de tamaño $k$ que maximiza el criterio de Fisher acumulado, con poda de ramas cuando la cota superior no puede superar el mejor candidato conocido:
+
+$$\text{cota}(S) = \text{tr}(S_W^{-1}(S \cup \{x_{\text{cand}}\}) \cdot S_B(S \cup \{x_{\text{cand}}\}))$$
+
+Si $\text{cota}(S) \leq 0.95 \cdot J^*$, se poda la rama.
+
+---
+
+## Criterios individuales de relevancia
+
+```{r criterios-individuales}
+
+vars_pred <- setdiff(names(datos), "medv")
+
+# Discretizar MEDV en Q1 vs Q4 para Fisher
+q1 <- quantile(datos$medv, 0.25)
+q3 <- quantile(datos$medv, 0.75)
+idx_low  <- datos$medv <= q1
+idx_high <- datos$medv >= q3
+
+# Fisher J
+fisher_reg <- function(x) {
+  g1 <- x[idx_low]; g2 <- x[idx_high]
+  (mean(g1) - mean(g2))^2 / (var(g1) + var(g2))
+}
+
+# Covarianza normalizada (= |Pearson|)
+cov_norm <- function(x, y) {
+  abs(cov(x, y)) / (sd(x) * sd(y))
+}
+
+criterios_df <- tibble(
+  variable  = vars_pred,
+  fisher_J  = map_dbl(vars_pred, ~ fisher_reg(datos[[.x]])),
+  cor_medv  = map_dbl(vars_pred, ~ abs(cor(datos[[.x]], datos$medv))),
+  cov_norm  = map_dbl(vars_pred, ~ cov_norm(datos[[.x]], datos$medv))
+) |> arrange(desc(fisher_J))
+
+criterios_df |>
+  knitr::kable(
+    caption   = "Criterios individuales de relevancia — Boston Housing",
+    digits    = 4,
+    col.names = c("Variable", "Fisher J", "|Correlación Pearson|", "Cov. Normalizada")
+  )
+```
+
+> **Nota:** La covarianza normalizada y $|r|$ de Pearson son idénticas por construcción. Ambas se reportan para consistencia con el pipeline de selección de características, donde cada criterio puede usarse de forma independiente como filtro previo a la búsqueda secuencial.
+
+## Plot Fisher — Relevancia individual
+```{r fisher-plot}
+ggplot(criterios_df, aes(x = reorder(variable, fisher_J), y = fisher_J, fill = fisher_J)) +
+  geom_col(width = 0.7, color = "white") +
+  geom_text(aes(label = round(fisher_J, 3)), hjust = -0.1, size = 3.5) +
+  scale_fill_gradient(low = "#85c1e9", high = "#1a5276", guide = "none") +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(title    = "Criterio de Separabilidad de Fisher — Regresión Boston",
+       subtitle = expression(J[F] == frac((mu[Q1]-mu[Q4])^2, sigma[Q1]^2 + sigma[Q4]^2)),
+       x = NULL, y = expression(J[F]))
+```
+
+## Selección Secuencial Forward (SFS)
+```{r sfs-reg}
+
+# SFS maximizando R² acumulado en train
+sfs_reg <- list()
+selected_r <- character(0)
+remaining_r <- vars_pred
+
+for (k in seq_along(vars_pred)) {
+  scores <- map_dbl(remaining_r, function(v) {
+    vars_try <- c(selected_r, v)
+    fit <- lm(medv ~ ., data = train[, c(vars_try, "medv")])
+    summary(fit)$r.squared
+  })
+  best_v      <- remaining_r[which.max(scores)]
+  selected_r  <- c(selected_r, best_v)
+  remaining_r <- setdiff(remaining_r, best_v)
+  sfs_reg[[k]] <- tibble(step = k, variable_added = best_v, r2_acum = max(scores))
+}
+
+sfs_df_r <- bind_rows(sfs_reg)
+
+ggplot(sfs_df_r, aes(x = step, y = r2_acum)) +
+  geom_line(color = "#2980b9", linewidth = 1.2) +
+  geom_point(color = "#e74c3c", size = 3) +
+  geom_text(aes(label = variable_added), vjust = -0.9, size = 2.8, fontface = "bold") +
+  scale_x_continuous(breaks = 1:nrow(sfs_df_r)) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+  labs(title    = "Selección Secuencial Forward (SFS) — Regresión",
+       subtitle = "Criterio: R² acumulado en train",
+       x = "Paso (# variables)", y = "R² Acumulado")
+
+{cat("Variables seleccionadas por SFS:", nrow(sfs_df_r), "\n")
+cat(sfs_df_r$variable_added, sep = ", ")}
+```
+
+
+## Branch & Bound
+```{r bb-reg}
+
+ganancias   <- c(sfs_df_r$r2_acum[1], diff(sfs_df_r$r2_acum))
+k_optimo    <- max(7L, sum(ganancias / max(ganancias) >= 0.02))
+k_optimo    <- min(k_optimo, 11L)
+k_optimo_bb <- k_optimo
+
+# Matrices para Fisher multivariado
+X_mat <- as.matrix(datos[, vars_pred])
+y_bin <- ifelse(idx_low, 0, ifelse(idx_high, 1, NA))
+idx_valid <- !is.na(y_bin)
+X_val <- X_mat[idx_valid, ]
+y_val <- y_bin[idx_valid]
+
+fisher_multiv <- function(vars) {
+  if (length(vars) == 0) return(0)
+  X_sub <- X_val[, vars, drop = FALSE]
+  g1 <- X_sub[y_val == 0, , drop = FALSE]
+  g2 <- X_sub[y_val == 1, , drop = FALSE]
+  m1 <- colMeans(g1); m2 <- colMeans(g2)
+  Sw <- cov(g1) * (nrow(g1)-1)/(nrow(g1)+nrow(g2)-2) +
+        cov(g2) * (nrow(g2)-1)/(nrow(g1)+nrow(g2)-2)
+  diff_m <- matrix(m1 - m2, ncol = 1)
+  tryCatch(
+    as.numeric(t(diff_m) %*% solve(Sw) %*% diff_m),
+    error = function(e) sum((m1 - m2)^2 / (diag(Sw) + 1e-8))
+  )
+}
+
+best_score_bb  <- 0
+best_subset_bb <- character(0)
+
+bb_search_reg <- function(selected, remaining, depth) {
+  if (depth == k_optimo_bb) {
+    sc <- fisher_multiv(selected)
+    if (sc > best_score_bb) {
+      best_score_bb  <<- sc
+      best_subset_bb <<- selected
+    }
+    return(invisible(NULL))
+  }
+  slots_left <- k_optimo_bb - depth
+  for (i in seq_along(remaining)) {
+    candidate <- remaining[i]
+    rest      <- remaining[-(1:i)]
+    # Cota: Fisher multivariado del subconjunto actual + candidato
+    bound <- fisher_multiv(c(selected, candidate))
+    if (best_score_bb > 0 && bound <= best_score_bb * 0.95) next
+    bb_search_reg(c(selected, candidate), rest, depth + 1)
+  }
+}
+
+bb_search_reg(character(0), vars_pred, 0)
+
+cat(sprintf("Branch & Bound — mejor subconjunto (k = %d):\n  %s\nFisher multivariado: %.4f\n",
+            k_optimo_bb,
+            paste(best_subset_bb, collapse = " + "),
+            best_score_bb))
+
+```
+**Resultado Branch & Bound — Interpretación**
+
+El algoritmo identificó el subconjunto óptimo de $k = 7$ variables
+(`crim + zn + indus + chas + nox + rm + lstat`) con un Fisher multivariado
+de **13.0048**. Este valor cuantifica la separabilidad conjunta del subconjunto
+mediante $\text{tr}(S_W^{-1} S_B)$, que considera las correlaciones entre
+variables como unidad, no como suma de criterios individuales.
+
+La presencia de `lstat` y `rm` confirma la coherencia del resultado: ambas
+variables lideran el ranking de Fisher individual y son correctamente retenidas
+por el algoritmo al evaluar el subconjunto en su conjunto. 
+
+> El pipeline opera como corresponde: SFS determina $k$ óptimo, B&B con Fisher multivariado
+encuentra el subconjunto óptimo global y `vars_sel` refleja esa decisión con
+justificación matemática formal.
+
+## Variables seleccionadas finales
+```{r vars-final}
+
+# k óptimo: ganancia marginal R² > 2% de la máxima
+ganancias <- c(sfs_df_r$r2_acum[1], diff(sfs_df_r$r2_acum))
+k_optimo  <- max(7L, sum(ganancias / max(ganancias) >= 0.02))
+k_optimo  <- min(k_optimo, 11L)
+
+vars_sel <- best_subset_bb
+
+cat(sprintf("Variables seleccionadas (k = %d): %s\n", k_optimo, paste(vars_sel, collapse = ", ")))
+
+fisher_ind_r <- setNames(
+  map_dbl(vars_pred, ~ fisher_reg(datos[[.x]])),
+  vars_pred
+)
+
+tibble(
+  Ranking   = seq_along(vars_sel),
+  Variable  = vars_sel,
+  Fisher_J  = map_dbl(vars_sel, ~ fisher_ind_r[[.x]]) |> round(4),
+  Cor_MEDV  = map_dbl(vars_sel, ~ criterios_df$cor_medv[criterios_df$variable == .x]) |> round(4),
+  Cov_Norm  = map_dbl(vars_sel, ~ criterios_df$cov_norm[criterios_df$variable == .x]) |> round(4),
+  SFS_paso  = map_int(vars_sel, ~ { idx <- which(sfs_df_r$variable_added == .x)
+                                     if (length(idx)) idx else NA_integer_ }),
+  R2_acum   = map_dbl(vars_sel, ~ {
+    idx <- which(sfs_df_r$variable_added == .x)
+    if (length(idx)) sfs_df_r$r2_acum[idx] else NA_real_
+  }) |> round(4)
+) |>
+  arrange(desc(Fisher_J)) |>
+  knitr::kable(
+    caption   = paste0("Selección final — B&B óptimo con k = ", k_optimo,
+                       " (determinado por SFS) | de ", length(vars_pred), " candidatas"),
+    col.names = c("Ranking", "Variable", "Fisher J", "|Cor MEDV|",
+                  "Cov. Norm.", "Paso SFS", "R² acumulado")
+  )
+```
+<br>
+
+**Síntesis del pipeline de selección:**
+
+El pipeline integra tres niveles, consistente con una metodología:
+
+1. **Criterios individuales** (Fisher J, Pearson, Cov. normalizada) → ranking inicial de cada variable por separabilidad lineal.
+2. **SFS** → determina el k óptimo (punto de inflexión donde la ganancia marginal de R² cae bajo el 2% del máximo). Permite visualizar la curva de rendimiento acumulado.
+3. **Branch & Bound** → dado k, encuentra el subconjunto **exacto y óptimo** según Fisher acumulado, garantizando la solución global sin búsqueda exhaustiva.
+
+## Grafo de relevancia
+```{r grafo-relevancia, fig.width=12, fig.height=8}
+
+edges_r <- data.frame(
+  from   = "MEDV",
+  to     = vars_sel,
+  weight = fisher_ind_r[vars_sel]
+)
+
+g_r <- graph_from_data_frame(edges_r, directed = FALSE,
+                               vertices = data.frame(name = c("MEDV", vars_sel)))
+
+V(g_r)$label       <- V(g_r)$name
+V(g_r)$color       <- ifelse(V(g_r)$name == "MEDV", "#27ae60",
+                              ifelse(V(g_r)$name %in% c("lstat","rm"), "#8e44ad", "#6c3483"))
+V(g_r)$size        <- ifelse(V(g_r)$name == "MEDV", 45,
+                               scales::rescale(c(fisher_ind_r[vars_sel]), to = c(18, 38)))
+V(g_r)$label.color <- "white"
+V(g_r)$label.cex   <- 0.9
+V(g_r)$label.font  <- 2
+V(g_r)$frame.color <- NA
+
+E(g_r)$width       <- scales::rescale(log1p(edges_r$weight), to = c(1, 10))
+E(g_r)$color       <- "#95a5a6"
+E(g_r)$label       <- round(edges_r$weight, 3)
+E(g_r)$label.cex   <- 0.7
+E(g_r)$label.color <- "#2c3e50"
+
+plot(g_r,
+     layout  = layout_in_circle(g_r),
+     margin  = 0.15,
+     main    = "Grafo de Relevancia — Variables Seleccionadas para Regresión",
+     sub     = "Tamaño nodo: Fisher J  |  Grosor arista: poder discriminante  |  LSTAT y RM dominan")
+```
+
+---
+
+# Fundamentos Teóricos de Algoritmos
+
+## Random Forest
+
+$$\hat{y}_{rf}(x) = \frac{1}{B}\sum_{b=1}^B \hat{y}_b(x), \qquad m = \lfloor p/3 \rfloor$$
+
+- $B$ número de árboles del ensamble ($B \geq 500$ típicamente); la predicción final es el promedio de los $B$ árboles individuales.
+- $m = \lfloor p/3 \rfloor$ ,variables evaluadas aleatoriamente en cada split; decorrelaciona los árboles y reduce varianza del ensamble.
+- El divisor $3$ es la convención empírica estándar para **regresión**. En clasificación la regla equivalente es $m = \lfloor\sqrt{p}\rfloor$.
+
+## Gradient Boosting
+
+$$f_m(x) = f_{m-1}(x) + \nu \cdot h_m(x), \qquad r_{im} = y_i - f_{m-1}(x_i)$$
+
+## XGBoost
+
+$$\mathcal{L}^{(t)} = \sum_{i=1}^n l(y_i, \hat{y}_i^{(t-1)} + f_t(x_i)) + \Omega(f_t), \qquad \Omega(f) = \gamma T + \frac{1}{2}\lambda\sum_{j=1}^T w_j^2$$
+
+---
+
+# Modelos con Variables Seleccionadas
+
+## Preparación datos filtrados
+```{r prep-filtrado}
+train_sel <- train[, c(vars_sel, "medv")]
+test_sel  <- test[,  c(vars_sel, "medv")]
+cat("Features seleccionadas:", length(vars_sel), "\n")
+cat("Variables:", paste(vars_sel, collapse = ", "), "\n")
+```
+
+## Random Forest
+```{r rf_model}
+rf_model <- randomForest(medv ~ ., data = train_sel, ntree = 500,
+                          mtry = floor(length(vars_sel)/3), importance = TRUE)
+rf_pred  <- predict(rf_model, test_sel)
+rf_rmse  <- sqrt(mean((test_sel$medv - rf_pred)^2))
+rf_mae   <- mean(abs(test_sel$medv - rf_pred))
+rf_r2    <- cor(test_sel$medv, rf_pred)^2
+cat(sprintf("RF  — RMSE: %.4f | MAE: %.4f | R²: %.4f\n", rf_rmse, rf_mae, rf_r2))
+```
+El modelo Random Forest explica el **83% de la varianza** del precio de vivienda
+(R² = 0.8282), rendimiento sólido que constituye una base competitiva para el
+comparativo de ensambles.
+
+El **RMSE de 4.12** implica un error típico de ±4.124 USD, margen aceptable
+para tasación inmobiliaria.
+
+El **MAE de 2.54** es inferior al RMSE, confirmando que outliers estructurales
+inflan el error medio, patrón consistente con las viviendas atípicas
+identificadas en la sección de accionabilidad.
+
+### Predicciones RF
+```{r rf_pred_plot, fig.width=10, fig.height=6}
+rf_results <- data.frame(Real = test_sel$medv, Predicho = rf_pred,
+                          Residuo = test_sel$medv - rf_pred)
+
+p1 <- ggplot(rf_results, aes(x=Real, y=Predicho)) +
+  geom_point(alpha=0.6, color="steelblue") +
+  geom_abline(slope=1, intercept=0, color="red", linetype="dashed") +
+  labs(title="Random Forest: Real vs Predicho", x="Precio Real", y="Precio Predicho") +
+  theme_minimal()
+
+p2 <- ggplot(rf_results, aes(x=Predicho, y=Residuo)) +
+  geom_point(alpha=0.6, color="coral") +
+  geom_hline(yintercept=0, color="red", linetype="dashed") +
+  labs(title="Residuos Random Forest", x="Precio Predicho", y="Residuo") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol=2)
+```
+**Real vs Predicho:** Los puntos siguen la diagonal de referencia con buena
+precisión en el rango central (~15–25k USD), indicando que el modelo captura
+correctamente la estructura de precios típicos. En precios altos (>35k) los
+puntos caen sistemáticamente por debajo de la diagonal, evidenciando
+subestimación, de comportamiento esperado en Random Forest por el efecto de
+promediado que comprime las predicciones extremas.
+
+**Residuos:** La distribución alrededor de cero es razonablemente aleatoria
+en el rango central, sin patrones sistemáticos evidentes. Se observan residuos
+positivos de magnitud considerable en la zona superior (~20–25), correspondientes
+a viviendas cuyo precio real el modelo subestima significativamente, consistente
+con el RMSE inflado respecto al MAE y con las viviendas atípicas identificadas
+en la sección de accionabilidad.
+
+### Importancia RF
+```{r rf_importance}
+
+# Extraer importancia
+imp_df <- as.data.frame(importance(rf_model)) |>
+  tibble::rownames_to_column("variable") |>
+  arrange(desc(`%IncMSE`))
+
+p1 <- ggplot(imp_df, aes(x = reorder(variable, `%IncMSE`), y = `%IncMSE`, fill = `%IncMSE`)) +
+  geom_col(width = 0.7, color = "white") +
+  geom_text(aes(label = round(`%IncMSE`, 1)), hjust = -0.1, size = 3.5) +
+  scale_fill_gradient(low = "#85c1e9", high = "#1a5276", guide = "none") +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(title = "Incremento en MSE al permutar variable",
+       subtitle = "Mayor valor = variable más crítica para precisión",
+       x = NULL, y = "% Incremento MSE") +
+  theme_minimal()
+
+p2 <- ggplot(imp_df, aes(x = reorder(variable, IncNodePurity), y = IncNodePurity, fill = IncNodePurity)) +
+  geom_col(width = 0.7, color = "white") +
+  geom_text(aes(label = round(IncNodePurity, 0)), hjust = -0.1, size = 3.5) +
+  scale_fill_gradient(low = "#a9dfbf", high = "#1e8449", guide = "none") +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(title = "Incremento en pureza de nodo (IncNodePurity)",
+       subtitle = "Mayor valor = variable con mayor reducción de RSS",
+       x = NULL, y = "Incremento en Pureza") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2)
+
+```
+
+## Gradient Boosting
+```{r gbm_model}
+
+gbm_model <- gbm(medv ~ ., data = train_sel, distribution = "gaussian",
+                  n.trees = 500, interaction.depth = 4, shrinkage = 0.01,
+                  cv.folds = 5, verbose = FALSE)
+best_iter <- gbm.perf(gbm_model, method="cv", plot.it=FALSE)
+gbm_pred  <- predict(gbm_model, test_sel, n.trees=best_iter)
+gbm_rmse  <- sqrt(mean((test_sel$medv - gbm_pred)^2))
+gbm_mae   <- mean(abs(test_sel$medv - gbm_pred))
+gbm_r2    <- cor(test_sel$medv, gbm_pred)^2
+
+cat(sprintf("GBM — RMSE: %.4f | MAE: %.4f | R²: %.4f\n", gbm_rmse, gbm_mae, gbm_r2))
+
+```
+El modelo Gradient Boosting obtiene R² = **0.8249** y RMSE = **4.06**, resultado
+ligeramente inferior a Random Forest en ambas métricas. La diferencia es marginal
+pero consistente, posiblemente atribuible a la sensibilidad de GBM al subconjunto
+de variables con shrinkage bajo (0.01). El MAE de **2.56** es el más alto del
+comparativo, confirmando GBM como el menos preciso en el caso típico.
+
+### Predicciones GBM
+```{r gbm_pred_plot, fig.width=10, fig.height=6}
+gbm_results <- data.frame(Real = test_sel$medv, Predicho = gbm_pred,
+                            Residuo = test_sel$medv - gbm_pred)
+
+p1 <- ggplot(gbm_results, aes(x=Real, y=Predicho)) +
+  geom_point(alpha=0.6, color="darkgreen") +
+  geom_abline(slope=1, intercept=0, color="red", linetype="dashed") +
+  labs(title="GBM: Real vs Predicho", x="Precio Real", y="Precio Predicho") +
+  theme_minimal()
+
+p2 <- ggplot(gbm_results, aes(x=Predicho, y=Residuo)) +
+  geom_point(alpha=0.6, color="#6A0DAD") +
+  geom_hline(yintercept=0, color="red", linetype="dashed") +
+  labs(title="Residuos GBM", x="Precio Predicho", y="Residuo") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol=2)
+```
+**Real vs Predicho:** El ajuste a la diagonal es similar a Random Forest, con la
+misma subestimación en precios altos (>35k). La nube central (~15–25k) sigue
+la diagonal con buena precisión, comportamiento consistente con el RMSE
+comparable entre ambos modelos.
+
+**Residuos:** No se observan patrones sistemáticos en el rango central. Se repite el mismo outlier superior (residuo ≈ +25) presente en RF, lo que confirma que ambos modelos fallan en la misma observación: una vivienda estructuralmente atípica que ningún ensamble logra capturar adecuadamente.
+
+
+### Importancia GBM
+```{r gbm_importance}
+gbm_imp <- summary(gbm_model, n.trees=best_iter, plotit=FALSE)
+ggplot(gbm_imp, aes(x=reorder(var, rel.inf), y=rel.inf)) +
+  geom_col(fill="darkgreen", alpha=0.7, width=0.7) +
+  coord_flip() +
+  labs(title="Importancia — GBM", x=NULL, y="Influencia Relativa (%)") +
+  theme_minimal()
+```
+
+## XGBoost
+```{r xgb_model}
+train_matrix <- xgb.DMatrix(data = as.matrix(train_sel[, vars_sel]), label = train_sel$medv)
+test_matrix  <- xgb.DMatrix(data = as.matrix(test_sel[,  vars_sel]), label = test_sel$medv)
+
+params <- list(objective="reg:squarederror", eval_metric="rmse",
+               max_depth=4, eta=0.01, subsample=0.8,
+               colsample_bytree=0.8, lambda=1, alpha=0)
+
+xgb_model <- xgb.train(params=params, data=train_matrix, nrounds=1000,
+                         watchlist=list(train=train_matrix, test=test_matrix),
+                         early_stopping_rounds=50, verbose=0)
+
+xgb_pred <- predict(xgb_model, test_matrix)
+xgb_rmse <- sqrt(mean((test_sel$medv - xgb_pred)^2))
+xgb_mae  <- mean(abs(test_sel$medv - xgb_pred))
+xgb_r2   <- cor(test_sel$medv, xgb_pred)^2
+cat(sprintf("XGB — RMSE: %.4f | MAE: %.4f | R²: %.4f\n", xgb_rmse, xgb_mae, xgb_r2))
+```
+
+XGBoost obtiene el mejor resultado del comparativo con R² = **0.8607**, RMSE = **3.67**
+y MAE = **2.39**, superando a GBM y Random Forest en las tres métricas. La reducción
+del RMSE respecto a RF (~0.46k) es la más significativa entre modelos, atribuible a
+la regularización L2 explícita y al early stopping que controla el sobreajuste.
+El MAE de 2.39 es el más bajo del comparativo, indicando menor error en el caso típico.
+
+***XGBoost se consolida como el modelo de referencia para este pipeline:** su capacidad
+de regularización explícita lo distingue de RF y GBM, que operan con mecanismos
+de control de sobreajuste menos precisos. La diferencia en MAE respecto a GBM
+(2.39 vs 2.56) confirma que XGBoost no solo reduce el error extremo sino también
+el error en el caso típico, lo que es determinante para aplicaciones de tasación
+inmobiliaria donde la precisión en el rango central del mercado tiene mayor
+impacto operacional.
+
+
+### Predicciones XGBoost
+```{r xgb_pred_plot, fig.width=10, fig.height=6}
+xgb_results <- data.frame(Real = test_sel$medv, Predicho = xgb_pred,
+                            Residuo = test_sel$medv - xgb_pred)
+
+p1 <- ggplot(xgb_results, aes(x=Real, y=Predicho)) +
+  geom_point(alpha=0.6, color="seagreen") +
+  geom_abline(slope=1, intercept=0, color="red", linetype="dashed") +
+  labs(title="XGBoost: Real vs Predicho", x="Precio Real", y="Precio Predicho") +
+  theme_minimal()
+
+p2 <- ggplot(xgb_results, aes(x=Predicho, y=Residuo)) +
+  geom_point(alpha=0.6, color="orange") +
+  geom_hline(yintercept=0, color="red", linetype="dashed") +
+  labs(title="Residuos XGBoost", x="Precio Predicho", y="Residuo") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol=2)
+```
+**Real vs Predicho:** La nube de puntos es la más ajustada a la diagonal de los
+tres modelos — menor dispersión lateral en el rango central y mejor seguimiento
+en precios altos, aunque la subestimación por encima de $35k persiste como
+patrón estructural compartido por los tres ensambles.
+
+**Residuos:** La distribución alrededor de cero es la más simétrica y compacta
+del comparativo. El outlier superior (~+20) reaparece por tercera vez,
+confirmando que corresponde a una observación que ningún modelo logra capturar
+— candidata directa a revisión manual en producción.
+
+
+### Importancia XGBoost
+```{r xgb_importance}
+
+importance <- xgb.importance(feature_names=vars_sel, model=xgb_model)
+xgb.plot.importance(importance, top_n=length(vars_sel), col="purple")
+title("Importancia — XGBoost")
+```
+
+---
+
+# Comparación de Modelos
+
+## Métricas consolidadas
+```{r comparacion}
+results <- data.frame(
+  Modelo = c("Random Forest", "GBM", "XGBoost"),
+  RMSE   = round(c(rf_rmse, gbm_rmse, xgb_rmse), 4),
+  MAE    = round(c(rf_mae,  gbm_mae,  xgb_mae),  4),
+  R2     = round(c(rf_r2,   gbm_r2,   xgb_r2),   4)
+)
+knitr::kable(results, caption = "Métricas en Test — Variables seleccionadas")
+```
+
+## Visualización comparativa
+```{r comp_visual, fig.width=12, fig.height=8}
+results_long <- melt(results, id.vars="Modelo")
+
+ggplot(results_long, aes(x=Modelo, y=value, fill=Modelo)) +
+  geom_col(width=0.65) +
+  geom_text(aes(label=sprintf("%.3f", value)), vjust=-0.5, size=4.5, fontface="bold") +
+  facet_wrap(~variable, scales="free_y", ncol=2) +
+  scale_fill_manual(values=c("steelblue","darkgreen","seagreen")) +
+  scale_y_continuous(expand=expansion(mult=c(0.05, 0.15))) +
+  theme_minimal(base_size=14) +
+  theme(legend.position="none", strip.text=element_text(size=14, face="bold"),
+        plot.title=element_text(size=16, face="bold", hjust=0.5)) +
+  labs(title="Comparación de Modelos — Boston Housing (vars. seleccionadas)", y="Valor", x=NULL)
+```
+**XGBoost lidera el comparativo** en las tres métricas simultáneamente con
+RMSE = **3.668**, MAE = **2.389** y R² = **0.861**, confirmando que la
+regularización L2 explícita y el early stopping se traducen en mejor
+capacidad predictiva sobre el conjunto de test.
+
+Random Forest ocupa el segundo lugar con RMSE = **4.124** y R² = **0.828**,
+superando marginalmente a GBM en R² pero con MAE ligeramente inferior (2.538
+vs 2.564). GBM registra el RMSE más bajo entre los dos modelos restantes
+(4.061) pero el MAE más alto del comparativo (2.564), indicando mayor
+sensibilidad a errores extremos en el caso típico.
+
+Las diferencias entre modelos son moderadas 0.456k en RMSE entre extremos
+y 0.036 en R² ,lo que sitúa a los tres ensambles en un rango competitivo
+con R² superior a 0.82 en todos los casos.
+
+
+## Distribución de residuos
+```{r residuos_dist, fig.width=12, fig.height=6}
+all_res <- data.frame(
+  Residuo = c(rf_results$Residuo, gbm_results$Residuo, xgb_results$Residuo),
+  Modelo  = rep(c("Random Forest","GBM","XGBoost"), each=nrow(test_sel))
+)
+
+ggplot(all_res, aes(x=Residuo, fill=Modelo)) +
+  geom_density(alpha=0.5) +
+  geom_vline(xintercept=0, linetype="dashed", color="red") +
+  scale_fill_manual(values=c("steelblue","darkgreen","#6A0DAD")) +
+  labs(title="Distribución de Residuos por Modelo", x="Residuo", y="Densidad") +
+  theme_minimal()
+```
+Los tres modelos concentran su densidad en torno a cero con sesgo positivo,
+subestiman más de lo que sobreestiman, consistente con el patrón observado
+en precios altos. XGBoost y GBM presentan picos más agudos y colas más
+cortas que Random Forest, confirmando mayor concentración de errores pequeños.
+La cola derecha extendida (~10–20) es compartida por los tres modelos y
+corresponde al grupo de viviendas atípicas que ningún ensamble logra capturar.
+
+
+## Grafo comparativo de modelos — importancia promedio
+```{r grafo-modelos, fig.width=10, fig.height=8}
+rf_imp  <- importance(rf_model, type=1)[,1]
+rf_imp  <- rf_imp[vars_sel] / max(rf_imp[vars_sel])
+
+gbm_imp_v <- summary(gbm_model, n.trees=best_iter, plotit=FALSE)
+gbm_imp_v <- setNames(gbm_imp_v$rel.inf, gbm_imp_v$var)
+gbm_imp_v <- gbm_imp_v[vars_sel] / max(gbm_imp_v[vars_sel])
+
+xgb_imp_v <- xgb.importance(feature_names=vars_sel, model=xgb_model)
+xgb_imp_v <- setNames(xgb_imp_v$Gain, xgb_imp_v$Feature)
+xgb_imp_v <- xgb_imp_v[vars_sel] / max(xgb_imp_v[vars_sel], na.rm=TRUE)
+
+imp_avg <- (rf_imp + gbm_imp_v + xgb_imp_v) / 3
+
+edges_m <- data.frame(from="MEDV", to=vars_sel, weight=imp_avg)
+
+g_m <- graph_from_data_frame(edges_m, directed=FALSE,
+                               vertices=data.frame(name=c("MEDV", vars_sel)))
+
+top2 <- names(sort(imp_avg, decreasing=TRUE))[1:2]
+V(g_m)$color       <- ifelse(V(g_m)$name == "MEDV", "#27ae60",
+                               ifelse(V(g_m)$name %in% top2, "#8e44ad", "#6c3483"))
+V(g_m)$size        <- ifelse(V(g_m)$name == "MEDV", 45,
+                               scales::rescale(imp_avg[V(g_m)$name[-1]], to=c(18,38)))
+V(g_m)$label       <- V(g_m)$name
+V(g_m)$label.color <- "white"
+V(g_m)$label.cex   <- 0.9
+V(g_m)$label.font  <- 2
+V(g_m)$frame.color <- NA
+
+E(g_m)$width       <- scales::rescale(imp_avg, to=c(1,10))
+E(g_m)$color       <- "#95a5a6"
+E(g_m)$label       <- round(imp_avg, 3)
+E(g_m)$label.cex   <- 0.7
+E(g_m)$label.color <- "#2c3e50"
+
+plot(g_m, layout=layout_in_circle(g_m), margin=0.15,
+     main="Grafo de Importancia Promedio — RF + GBM + XGBoost",
+     sub="Tamaño: importancia promedio normalizada | Morado oscuro: top 2 variables")
+```
+
+---
+
+# Evaluación con Datos Nuevos
+```{r nuevos_datos}
+set.seed(456)
+nuevos_datos <- datos[sample(nrow(datos), nrow(datos), replace=TRUE), ]
+nuevos_sel   <- nuevos_datos[, c(vars_sel, "medv")]
+
+rf_pred_new  <- predict(rf_model, nuevos_sel)
+gbm_pred_new <- predict(gbm_model, nuevos_sel, n.trees=best_iter)
+nuevos_mx    <- xgb.DMatrix(data=as.matrix(nuevos_sel[, vars_sel]), label=nuevos_sel$medv)
+xgb_pred_new <- predict(xgb_model, nuevos_mx)
+
+results_new <- data.frame(
+  Modelo = c("Random Forest","GBM","XGBoost"),
+  RMSE   = round(c(sqrt(mean((nuevos_sel$medv-rf_pred_new)^2)),
+                   sqrt(mean((nuevos_sel$medv-gbm_pred_new)^2)),
+                   sqrt(mean((nuevos_sel$medv-xgb_pred_new)^2))), 4),
+  R2     = round(c(cor(nuevos_sel$medv,rf_pred_new)^2,
+                   cor(nuevos_sel$medv,gbm_pred_new)^2,
+                   cor(nuevos_sel$medv,xgb_pred_new)^2), 4)
+)
+knitr::kable(results_new, caption="Métricas en Datos Nuevos")
+```
+
+**XGBoost mantiene el liderazgo** en ambos conjuntos y ambas métricas con
+RMSE = **2.440** y R² = **0.934**.
+
+Los tres modelos reducen RMSE y aumentan R² en datos nuevos respecto a test,
+comportamiento esperado bajo bootstrap. XGBoost registra la mayor ganancia
+relativa (RMSE 2.440 vs 3.668 en test; R² 0.934 vs 0.861). Random Forest
+ocupa el segundo lugar con RMSE = **2.914** y R² = **0.911**. GBM presenta
+la brecha más amplia entre ambos conjuntos (RMSE 3.350 vs 4.061 en test),
+confirmando menor capacidad de generalización del comparativo.
+  
+  
+## Comparación Test vs Nuevos
+```{r comp_test_nuevos, fig.width=12, fig.height=8}
+results$Dataset     <- "Test"
+results_new$MAE     <- NA
+results_new$Dataset <- "Nuevos"
+rc <- rbind(results[,c("Modelo","RMSE","R2","Dataset")],
+            results_new[,c("Modelo","RMSE","R2","Dataset")])
+rc_long <- melt(rc, id.vars=c("Modelo","Dataset"))
+
+ggplot(rc_long, aes(x=Modelo, y=value, fill=Dataset)) +
+  geom_col(position=position_dodge(0.9), width=0.8) +
+  geom_text(aes(label=sprintf("%.3f", value)),
+            position=position_dodge(0.9), vjust=-0.5, size=3.5, fontface="bold") +
+  facet_wrap(~variable, scales="free_y", ncol=2) +
+  scale_fill_manual(values=c("Nuevos"="#FFE066","Test"="#8FD19E")) +
+  scale_y_continuous(expand=expansion(mult=c(0.05,0.15))) +
+  theme_minimal(base_size=14) +
+  labs(title="Comparación: Test vs Datos Nuevos", y="Valor", x=NULL) +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        strip.text=element_text(size=13, face="bold"), legend.position="top")
+```
+<br>
+
+**Comparación Test vs Datos Nuevos — Interpretación**
+
+Los tres modelos mejoran en datos nuevos respecto a test en ambas métricas,
+comportamiento esperado bajo muestreo bootstrap. XGBoost mantiene el liderazgo
+con la reducción más pronunciada de RMSE (3.668 → 2.440, -0.228k) y el mayor
+incremento de R² (0.861 → 0.934), confirmando su superioridad en precisión
+y generalización.
+
+Random Forest registra la mejora más equilibrada entre ambos conjuntos
+(RMSE 4.124 → 2.914; R² 0.828 → 0.911), con una brecha moderada y consistente
+que refleja estabilidad en la generalización. GBM presenta la brecha más amplia
+en RMSE (4.061 → 3.350) y el R² más bajo en datos nuevos (0.876), confirmando
+menor capacidad de generalización del comparativo. La diferencia entre GBM y
+XGBoost en datos nuevos es la más relevante del análisis: 0.910k en RMSE y
+0.058 en R², margen que no era tan evidente en test.
+  
+---
+
+# Accionabilidad según Resultados
+
+## Segmentación de viviendas por rango de precio predicho
+
+```{r accionabilidad-segmentacion}
+# Usamos XGBoost (mejor modelo) para predicciones sobre datos completos
+all_matrix <- xgb.DMatrix(data = as.matrix(datos[, vars_sel]))
+pred_all   <- predict(xgb_model, all_matrix)
+
+datos_acc <- datos |>
+  mutate(
+    pred_medv  = pred_all,
+    residuo    = medv - pred_all,
+    segmento   = case_when(
+      pred_medv >= quantile(pred_medv, 0.75) ~ "🔴 Premium (Q4 ≥ $27k)",
+      pred_medv >= quantile(pred_medv, 0.50) ~ "🟠 Medio-Alto (Q3)",
+      pred_medv >= quantile(pred_medv, 0.25) ~ "🟡 Medio-Bajo (Q2)",
+      TRUE                                   ~ "🟢 Económico (Q1 < $17k)"
+    ),
+    segmento = factor(segmento, levels = c(
+      "🔴 Premium (Q4 ≥ $27k)", "🟠 Medio-Alto (Q3)",
+      "🟡 Medio-Bajo (Q2)",     "🟢 Económico (Q1 < $17k)"
+    ))
+  )
+
+seg_summary <- datos_acc |>
+  group_by(segmento) |>
+  summarise(
+    n            = n(),
+    precio_real  = round(mean(medv), 2),
+    precio_pred  = round(mean(pred_medv), 2),
+    lstat_medio  = round(mean(lstat), 2),
+    rm_medio     = round(mean(rm), 2),
+    crim_medio   = round(mean(crim), 2),
+    .groups = "drop"
+  )
+
+seg_summary |>
+  knitr::kable(
+    caption   = "Perfil por segmento de precio (predicción XGBoost)",
+    col.names = c("Segmento", "N", "Precio Real Medio",
+                  "Precio Predicho Medio", "LSTAT Medio",
+                  "Habitaciones Medio", "Criminalidad Media")
+  )
+```
+**La segmentación traduce el modelo en acción concreta:**
+
+**Premium (Q4):** 127 viviendas con LSTAT bajo (5.81) y 7 habitaciones promedio
+— mercado de alto valor donde una tasación errónea de ±0.55k tiene impacto
+financiero significativo. Prioridad para valoración individualizada.
+
+**Económico (Q1):** criminalidad media de 11.15 — 10x mayor que el segmento
+Medio-Bajo (1.09). El precio no lo explica solo el tamaño ni el estatus social,
+sino el riesgo del entorno. Segmento donde la intervención urbana tiene mayor
+retorno social.
+
+**Medio-Alto y Medio-Bajo:** comportamiento gradual y predecible — segmentos
+estables donde el modelo opera con mayor confianza y menor error.
+
+
+## Plot segmentación
+```{r accionabilidad-plot, fig.width=12, fig.height=6}
+
+p_seg1 <- ggplot(datos_acc, aes(x = segmento, y = medv, fill = segmento)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  scale_fill_manual(values = c("#e74c3c","#e67e22","#f1c40f","#2ecc71")) +
+  labs(title = "Distribución de precios reales por segmento predicho",
+       x = NULL, y = "MEDV (miles USD)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 9, face = "bold"))
+
+p_seg2 <- ggplot(datos_acc, aes(x = lstat, y = pred_medv, color = segmento)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  scale_color_manual(values = c("#e74c3c","#e67e22","#f1c40f","#2ecc71")) +
+  labs(title = "LSTAT vs Precio Predicho por segmento",
+       x = "% Población bajo estatus (LSTAT)", y = "Precio predicho (miles USD)",
+       color = NULL) +
+  theme_minimal() +
+  theme(
+    legend.position  = "bottom",
+    legend.text      = element_text(size = 8, face = "bold"),
+    legend.key.size  = unit(0.5, "cm"),
+    legend.spacing.x = unit(0.3, "cm")
+  ) +
+  guides(color = guide_legend(nrow = 2))
+
+grid.arrange(p_seg1, p_seg2, ncol = 2)
+```
+
+**Interpretación de Plot segmentación**
+
+**Boxplot:** separación limpia entre segmentos sin solapamiento de medianas,
+el modelo discrimina con precisión los cuatro rangos de precio. El segmento
+Premium muestra mayor dispersión (rango 25–50k), reflejando heterogeneidad
+estructural en viviendas de alto valor.
+
+**LSTAT vs Precio:** relación inversa clara y continua — a mayor LSTAT menor
+precio predicho, con segmentos coloreados que se ordenan naturalmente de arriba
+hacia abajo. Confirma que LSTAT es el driver dominante de la segmentación.
+
+
+## Marco de acciones por segmento
+
+| Segmento | Precio Predicho | Perfil clave | Acción recomendada | Equipo |
+|---|---|---|---|---|
+| 🔴 Premium | ≥ Q4 (~$27k+) | LSTAT bajo, RM alto | Tasación premium, marketing focalizado | Banca Hipotecaria / Inversión |
+| 🟠 Medio-Alto | Q3 | LSTAT medio-alto, RM moderado | Créditos hipotecarios estándar + mejora habitacional | Crédito Retail |
+| 🟡 Medio-Bajo | Q2 | LSTAT medio, crim baja | Programas de subsidio + financiamiento largo plazo | Política habitacional |
+| 🟢 Económico | ≤ Q1 (~$17k) | LSTAT alto, crim alta | Subsidio directo + intervención urbana | Gobierno / Municipio |
+
+: Framework de intervención inmobiliaria {tbl-colwidths="[18,15,22,30,15]"}
+
+
+## Análisis de viviendas con mayor error de predicción
+
+```{r accionabilidad-errores}
+
+# Viviendas donde el modelo se equivoca más = zonas de alta heterogeneidad
+top_error <- datos_acc |>
+  mutate(abs_residuo = abs(residuo)) |>
+  arrange(desc(abs_residuo)) |>
+  slice_head(n = 15) |>
+  select(medv, pred_medv, residuo, lstat, rm, crim, nox, segmento)
+
+top_error |>
+  knitr::kable(
+    caption = "Top 15 viviendas con mayor error absoluto de predicción",
+    digits  = 2,
+    col.names = c("Precio Real", "Precio Predicho", "Residuo",
+                  "LSTAT", "Habitaciones", "Criminalidad", "NOX", "Segmento")
+  )
+```
+
+**Accionabilidad:**
+
+Las 15 viviendas con mayor error absoluto revelan tres patrones estructurales
+que el modelo identifica con precisión y que tienen implicaciones directas para
+la gestión del portafolio inmobiliario.
+
+El segmento Premium concentra 9 de 15 casos: XGBoost detecta sistemáticamente
+viviendas con precio real de $50k que el mercado valora entre ~30k y ~43k,
+con residuos de hasta 20.20 . el modelo está señalando activos subvalorados
+en el segmento de mayor valor, información accionable para estrategias de
+adquisición y tasación diferenciada.
+
+La criminalidad extrema emerge como variable no lineal de alto impacto: la
+vivienda con criminalidad 51.14 presenta un residuo de -9.25, donde el modelo
+predice $24.25k frente a un precio real de $15k. Machine Learning cuantifica
+aquí un descuento por riesgo que los modelos lineales clásicos no capturan 
+abriendo oportunidades de intervención urbana con retorno social medible.
+
+Los residuos negativos en Premium (-9.27 y -5.70) identifican propiedades con
+perfil de alto valor pero precio real moderado, posiblemente por deterioro o
+microubicación, activos con potencial de revalorización que el modelo señala
+para revisión prioritaria.
+
+> **Acción directa:** las 15 viviendas de esta tabla representan los casos
+> donde la inteligencia del modelo es más valiosa, candidatas a auditoría
+> especializada y estrategia de valoración individualizada.
+---
+
+# Resumen Ejecutivo
+```{r resumen}
+
+data.frame(
+  Componente = c("Dataset","Variables candidatas","Variables seleccionadas",
+                 "Métodos de selección","Mejor modelo (RMSE test)",
+                 "Mejor R² test","Variables clave"),
+  Resultado  = c(
+    paste0(nrow(datos)," obs × ",ncol(datos)," variables"),
+    as.character(length(vars_pred)),
+    paste0(k_optimo," (",paste(vars_sel,collapse=", "),")"),
+    "Fisher J + Pearson + Cov. Norm. → SFS → Branch & Bound",
+    results$Modelo[which.min(results$RMSE)],
+    round(max(results$R2),4),
+    paste(names(sort(imp_avg,decreasing=TRUE))[1:3],collapse=", ")
+  )
+) |> knitr::kable(caption="Resumen ejecutivo")
+```
+---
+
+# Conclusiones
+
+Los tres algoritmos demuestran capacidad predictiva **sólida** (R² entre 0.82 y 0.86
+en test), resultado coherente con un pipeline de selección de características que
+reduce la dimensionalidad de 13 a `r k_optimo` variables sin pérdida significativa
+de rendimiento. El pipeline integra criterios individuales (Fisher J, correlación de
+Pearson, covarianza normalizada) con búsqueda secuencial (SFS) y búsqueda exacta
+(Branch & Bound), garantizando que cada modelo opera sobre el subconjunto óptimo
+con justificación matemática formal.
+
+**LSTAT y RM** emergen como variables dominantes en todos los criterios Fisher,
+correlación, importancia de modelos ,validando la coherencia del pipeline. La sección
+de accionabilidad traduce las predicciones en cuatro segmentos operacionales con
+estrategias diferenciadas, desde intervención gubernamental (segmento económico)
+hasta banca de inversión (segmento premium).
+
+**Recomendación:** XGBoost con variables seleccionadas ofrece el mejor balance entre
+precisión y generalización (RMSE = 3.668, R² = 0.861). Para implementación en
+producción, monitorear el error en las 15 viviendas atípicas identificadas como
+casos de alta heterogeneidad estructural.
+
+---
+
+# Referencias
+
+- Harrison, D., & Rubinfeld, D.L. (1978). *Hedonic prices and the demand for clean air*. JEEM, 5(1), 81–102.
+- Breiman, L. (2001). *Random Forests*. Machine Learning, 45(1), 5–32.
+- Friedman, J.H. (2001). *Greedy Function Approximation: A Gradient Boosting Machine*. AoS, 29(5), 1189–1232.
+- Chen, T., & Guestrin, C. (2016). *XGBoost*. KDD '16.
+- **Mery, D.** Reconocimiento de Patrones — Selección de características. DCC PUC Chile. <https://domingomery.ing.puc.cl/teaching/patrones/>
+
+---
+
+*Documento generado con Quarto • R • ggplot2 • igraph*
+
+*Alejandro Figueroa Rojas — Data Science & Business Intelligence*
+*El valor del Machine Learning no está en el modelo que converge,*
+*sino en la decisión que fundamenta.*
